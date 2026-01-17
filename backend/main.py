@@ -48,6 +48,96 @@ class ExportRequest(BaseModel):
     duration: float
 
 
+class TokenizeRequest(BaseModel):
+    """Token化请求模型"""
+    notes: List[Note]
+    duration: float
+    time_quantization: int = 100  # 时间量化单位（毫秒）
+    vocab_type: str = "compound"  # compound: 复合token, simple: 简单token
+
+
+def midi_to_tokens(notes: List[Dict], duration: float, time_quantization: int = 100, vocab_type: str = "compound") -> List:
+    """
+    将 MIDI 音符转换为 Token 序列
+    
+    支持两种 Token 化方式：
+    1. compound: 复合 token，格式如 [TIME_50, NOTE_ON_60_80, NOTE_OFF_60, ...]
+    2. simple: 简单 token，格式如 [50, 1, 60, 80, 2, 60, ...]
+    
+    Args:
+        notes: 音符列表
+        duration: MIDI 总时长
+        time_quantization: 时间量化单位（毫秒）
+        vocab_type: Token 类型
+    
+    Returns:
+        Token 序列
+    """
+    # 创建事件列表：(时间, 事件类型, 音高, 力度, 是否旋律)
+    events = []
+    
+    for note in notes:
+        # NOTE_ON 事件
+        events.append({
+            'time': note['start'],
+            'type': 'note_on',
+            'pitch': note['pitch'],
+            'velocity': note['velocity'],
+            'is_melody': note['is_melody']
+        })
+        # NOTE_OFF 事件
+        events.append({
+            'time': note['end'],
+            'type': 'note_off',
+            'pitch': note['pitch'],
+            'velocity': 0,
+            'is_melody': note['is_melody']
+        })
+    
+    # 按时间排序
+    events.sort(key=lambda x: (x['time'], x['type'] == 'note_off'))
+    
+    # 转换为 Token
+    tokens = []
+    current_time = 0
+    
+    if vocab_type == "compound":
+        # 复合 Token 方式
+        for event in events:
+            # 计算时间差（量化）
+            time_delta = int((event['time'] - current_time) * 1000 / time_quantization)
+            
+            if time_delta > 0:
+                tokens.append(f"TIME_SHIFT_{time_delta}")
+                current_time = event['time']
+            
+            # 音符事件
+            melody_tag = "_MELODY" if event['is_melody'] else "_ACCOMP"
+            if event['type'] == 'note_on':
+                tokens.append(f"NOTE_ON_{event['pitch']}_{event['velocity']}{melody_tag}")
+            else:
+                tokens.append(f"NOTE_OFF_{event['pitch']}{melody_tag}")
+    
+    elif vocab_type == "simple":
+        # 简单 Token 方式（数字序列）
+        for event in events:
+            # 时间差（量化）
+            time_delta = int((event['time'] - current_time) * 1000 / time_quantization)
+            
+            if time_delta > 0:
+                tokens.extend([0, time_delta])  # 0 = TIME_SHIFT
+                current_time = event['time']
+            
+            # 音符事件
+            melody_flag = 1 if event['is_melody'] else 0
+            if event['type'] == 'note_on':
+                tokens.extend([1, event['pitch'], event['velocity'], melody_flag])  # 1 = NOTE_ON
+            else:
+                tokens.extend([2, event['pitch'], melody_flag])  # 2 = NOTE_OFF
+    
+    return tokens
+
+
 def skyline_algorithm(notes: List[Dict], time_window: float = 0.05) -> List[Dict]:
     """
     Skyline 算法：在每个时间窗口内，标记音高最高的音符为主旋律
@@ -202,6 +292,46 @@ async def export_midi(request: ExportRequest):
     
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"导出 MIDI 文件时出错: {str(e)}")
+
+
+@app.post("/tokenize")
+async def tokenize_midi(request: TokenizeRequest):
+    """
+    将 MIDI 数据转换为 Token 序列
+    
+    支持两种格式：
+    - compound: 复合token (如 "TIME_SHIFT_10", "NOTE_ON_60_80_MELODY")
+    - simple: 简单数字序列 (如 [0, 10, 1, 60, 80, 1])
+    """
+    try:
+        # 转换为字典格式
+        notes_dict = [note.dict() for note in request.notes]
+        
+        # 生成 Token
+        tokens = midi_to_tokens(
+            notes_dict,
+            request.duration,
+            request.time_quantization,
+            request.vocab_type
+        )
+        
+        # 统计信息
+        melody_count = sum(1 for n in request.notes if n.is_melody)
+        accomp_count = len(request.notes) - melody_count
+        
+        return {
+            "tokens": tokens,
+            "token_count": len(tokens),
+            "note_count": len(request.notes),
+            "melody_count": melody_count,
+            "accompaniment_count": accomp_count,
+            "duration": request.duration,
+            "vocab_type": request.vocab_type,
+            "time_quantization_ms": request.time_quantization
+        }
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Token化时出错: {str(e)}")
 
 
 if __name__ == "__main__":

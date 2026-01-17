@@ -27,6 +27,25 @@
           {{ isPlaying ? '⏸ 暂停' : '▶ 播放' }}
         </button>
         
+        <!-- 速度控制 -->
+        <div class="speed-control" v-if="midiData">
+          <button 
+            class="btn btn-small" 
+            @click="changeSpeed(-0.25)"
+            :disabled="playbackSpeed <= 0.25"
+          >
+            −
+          </button>
+          <span class="speed-display">{{ playbackSpeed.toFixed(2) }}x</span>
+          <button 
+            class="btn btn-small" 
+            @click="changeSpeed(0.25)"
+            :disabled="playbackSpeed >= 2.0"
+          >
+            +
+          </button>
+        </div>
+        
         <!-- Solo 模式 -->
         <label class="checkbox-label">
           <input 
@@ -46,6 +65,15 @@
           💾 导出分轨
         </button>
         
+        <!-- Token化按钮 -->
+        <button 
+          class="btn btn-warning" 
+          @click="tokenizeMidi"
+          :disabled="!midiData"
+        >
+          🔤 转Token
+        </button>
+        
         <!-- 统计信息 -->
         <div class="stats" v-if="midiData">
           <span class="stat-item melody">旋律: {{ melodyCount }}</span>
@@ -54,6 +82,16 @@
         </div>
       </div>
     </header>
+    
+    <!-- 播放进度条 -->
+    <div class="progress-bar-container" v-if="midiData">
+      <div class="progress-time">{{ formatTime(currentTime) }}</div>
+      <div class="progress-bar" @click="seekTo">
+        <div class="progress-fill" :style="{ width: progressPercent + '%' }"></div>
+        <div class="progress-handle" :style="{ left: progressPercent + '%' }"></div>
+      </div>
+      <div class="progress-time">{{ formatTime(midiData.duration) }}</div>
+    </div>
     
     <!-- 主视图区域 -->
     <main class="main-content">
@@ -76,7 +114,10 @@
         v-else
         :notes="midiData.notes"
         :duration="midiData.duration"
+        :current-time="currentTime"
+        :is-playing="isPlaying"
         @update:notes="handleNotesUpdate"
+        @play-note="playNote"
       />
     </main>
     
@@ -89,7 +130,7 @@
 </template>
 
 <script setup>
-import { ref, computed } from 'vue'
+import { ref, computed, watch } from 'vue'
 import axios from 'axios'
 import * as Tone from 'tone'
 import PianoRoll from './components/PianoRoll.vue'
@@ -100,6 +141,9 @@ const isLoading = ref(false)
 const loadingText = ref('处理中...')
 const isPlaying = ref(false)
 const soloMode = ref(false)
+const playbackSpeed = ref(1.0)
+const currentTime = ref(0)
+const pausedTime = ref(0)
 
 // API 基础路径
 const API_BASE = '/api'
@@ -123,6 +167,21 @@ const totalNotes = computed(() => {
 // Tone.js 播放器
 let synth = null
 let scheduledNotes = []
+let progressInterval = null
+let startTime = 0
+
+// 计算属性：播放进度百分比
+const progressPercent = computed(() => {
+  if (!midiData.value || !midiData.value.duration) return 0
+  return (currentTime.value / midiData.value.duration) * 100
+})
+
+// 格式化时间显示
+const formatTime = (seconds) => {
+  const mins = Math.floor(seconds / 60)
+  const secs = Math.floor(seconds % 60)
+  return `${mins}:${secs.toString().padStart(2, '0')}`
+}
 
 /**
  * 初始化音频合成器
@@ -198,47 +257,149 @@ const togglePlay = async () => {
  * 开始播放
  */
 const startPlayback = async () => {
-  await Tone.start()
-  initSynth()
-  
-  isPlaying.value = true
-  const now = Tone.now()
-  
-  // 筛选要播放的音符
-  const notesToPlay = soloMode.value 
-    ? midiData.value.notes.filter(n => n.is_melody)
-    : midiData.value.notes
-  
-  // 调度所有音符
-  notesToPlay.forEach(note => {
-    const midiNote = Tone.Frequency(note.pitch, 'midi').toNote()
-    const duration = note.end - note.start
-    const velocity = note.velocity / 127
+  try {
+    await Tone.start()
+    console.log('🎵 Tone.js started')
     
-    scheduledNotes.push(
-      Tone.Transport.schedule((time) => {
-        synth.triggerAttackRelease(midiNote, duration, time, velocity)
-      }, now + note.start)
-    )
-  })
-  
-  // 播放完成后停止
-  const duration = midiData.value.duration
-  Tone.Transport.schedule(() => {
-    stopPlayback()
-  }, now + duration)
-  
-  Tone.Transport.start()
+    initSynth()
+    
+    isPlaying.value = true
+    startTime = Tone.now()
+    const resumeFrom = pausedTime.value
+    
+    console.log(`▶️ Starting playback from ${resumeFrom.toFixed(2)}s, speed: ${playbackSpeed.value}x`)
+    console.log(`🎚️ Solo Mode: ${soloMode.value}`)
+    
+    // 筛选要播放的音符
+    const notesToPlay = soloMode.value 
+      ? midiData.value.notes.filter(n => n.is_melody)
+      : midiData.value.notes
+    
+    console.log(`🎼 Total notes to play: ${notesToPlay.length}`)
+    console.log(`📊 Original notes: ${midiData.value.notes.length}, Melody: ${midiData.value.notes.filter(n => n.is_melody).length}, Accomp: ${midiData.value.notes.filter(n => !n.is_melody).length}`)
+    
+    // 直接调度所有音符（不使用Transport）
+    let scheduledCount = 0
+    notesToPlay.forEach(note => {
+      if (note.end > resumeFrom) {
+        const midiNote = Tone.Frequency(note.pitch, 'midi').toNote()
+        const duration = (note.end - note.start) / playbackSpeed.value
+        const velocity = note.velocity / 127
+        const scheduleTime = Math.max(0, note.start - resumeFrom) / playbackSpeed.value
+        const absoluteTime = Tone.now() + scheduleTime
+        
+        // 直接使用 Tone.Draw.schedule 调度
+        const eventId = Tone.Transport.scheduleOnce(() => {
+          synth.triggerAttackRelease(midiNote, duration, Tone.now(), velocity)
+        }, `+${scheduleTime}`)
+        
+        scheduledNotes.push(eventId)
+        scheduledCount++
+      }
+    })
+    
+    console.log(`✅ Scheduled ${scheduledCount} notes`)
+    
+    // 播放完成后停止
+    const remainingDuration = (midiData.value.duration - resumeFrom) / playbackSpeed.value
+    Tone.Transport.scheduleOnce(() => {
+      console.log('🛑 Playback complete')
+      stopPlayback(true)
+    }, `+${remainingDuration}`)
+    
+    // 启动进度更新
+    progressInterval = setInterval(() => {
+      currentTime.value = resumeFrom + (Tone.now() - startTime) * playbackSpeed.value
+      if (currentTime.value >= midiData.value.duration) {
+        currentTime.value = midiData.value.duration
+      }
+    }, 50)
+    
+    Tone.Transport.start()
+    console.log('🚀 Transport started')
+  } catch (error) {
+    console.error('❌ Playback error:', error)
+    isPlaying.value = false
+  }
 }
 
 /**
  * 停止播放
  */
-const stopPlayback = () => {
+const stopPlayback = (isComplete = false) => {
+  console.log(`⏸️ Stopping playback, complete: ${isComplete}`)
+  
   isPlaying.value = false
+  
+  // 清除进度更新定时器
+  if (progressInterval) {
+    clearInterval(progressInterval)
+    progressInterval = null
+  }
+  
+  // 记录暂停位置
+  if (!isComplete) {
+    pausedTime.value = currentTime.value
+    console.log(`📍 Paused at ${pausedTime.value.toFixed(2)}s`)
+  } else {
+    // 播放完成，重置到开头
+    pausedTime.value = 0
+    currentTime.value = 0
+    console.log('🔄 Reset to start')
+  }
+  
   Tone.Transport.stop()
   Tone.Transport.cancel()
   scheduledNotes = []
+  
+  // 释放所有正在播放的音符
+  if (synth) {
+    synth.releaseAll()
+  }
+}
+
+/**
+ * 改变播放速度
+ */
+const changeSpeed = (delta) => {
+  playbackSpeed.value = Math.max(0.25, Math.min(2.0, playbackSpeed.value + delta))
+  
+  // 如果正在播放，需要重新开始
+  if (isPlaying.value) {
+    stopPlayback()
+    startPlayback()
+  }
+}
+
+/**
+ * 播放单个音符（供PianoRoll组件调用）
+ */
+const playNote = (pitch, velocity = 80, duration = 0.3) => {
+  initSynth()
+  const midiNote = Tone.Frequency(pitch, 'midi').toNote()
+  const vel = velocity / 127
+  synth.triggerAttackRelease(midiNote, duration, Tone.now(), vel)
+  console.log(`🎹 Playing note: ${midiNote} (pitch: ${pitch})`)
+}
+
+/**
+ * 点击进度条跳转
+ */
+const seekTo = (event) => {
+  if (!midiData.value) return
+  
+  const rect = event.currentTarget.getBoundingClientRect()
+  const percent = (event.clientX - rect.left) / rect.width
+  const newTime = percent * midiData.value.duration
+  
+  currentTime.value = newTime
+  pausedTime.value = newTime
+  
+  // 如果正在播放，重新开始
+  if (isPlaying.value) {
+    stopPlayback()
+    startPlayback()
+  }
 }
 
 /**
@@ -275,6 +436,70 @@ const exportMidi = async () => {
     isLoading.value = false
   }
 }
+
+/**
+ * Token化 MIDI 数据
+ */
+const tokenizeMidi = async () => {
+  if (!midiData.value) return
+  
+  isLoading.value = true
+  loadingText.value = '正在转换为 Token...'
+  
+  try {
+    // 让用户选择Token类型
+    const vocabType = confirm('选择 Token 格式:\n\n确定 = 复合格式 (如 "NOTE_ON_60_80_MELODY")\n取消 = 简单格式 (如 [1, 60, 80, 1])') 
+      ? 'compound' 
+      : 'simple'
+    
+    const response = await axios.post(`${API_BASE}/tokenize`, {
+      notes: midiData.value.notes,
+      duration: midiData.value.duration,
+      time_quantization: 100,  // 100ms 量化
+      vocab_type: vocabType
+    })
+    
+    const result = response.data
+    console.log('🔤 Token化结果:', result)
+    
+    // 创建下载文件
+    const tokenData = JSON.stringify(result, null, 2)
+    const blob = new Blob([tokenData], { type: 'application/json' })
+    const url = window.URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.setAttribute('download', `tokens_${vocabType}.json`)
+    document.body.appendChild(link)
+    link.click()
+    link.remove()
+    
+    // 显示统计信息
+    alert(`✅ Token化完成!\n\n` +
+      `Token数量: ${result.token_count}\n` +
+      `音符数量: ${result.note_count}\n` +
+      `旋律音符: ${result.melody_count}\n` +
+      `伴奏音符: ${result.accompaniment_count}\n` +
+      `格式: ${result.vocab_type}\n\n` +
+      `已保存到: tokens_${vocabType}.json`)
+    
+  } catch (error) {
+    console.error('Token化失败:', error)
+    alert('Token化失败：' + (error.response?.data?.detail || error.message))
+  } finally {
+    isLoading.value = false
+  }
+}
+
+// 监听 Solo Mode 切换
+watch(soloMode, (newValue, oldValue) => {
+  console.log(`🎚️ Solo Mode changed: ${oldValue} → ${newValue}`)
+  // 如果正在播放，重新开始以应用新的模式
+  if (isPlaying.value) {
+    console.log('🔄 Restarting playback with new mode...')
+    stopPlayback(false)
+    startPlayback()
+  }
+})
 </script>
 
 <style scoped>
@@ -353,9 +578,47 @@ const exportMidi = async () => {
   background: #7c3aed;
 }
 
+.btn-warning {
+  background: #f59e0b;
+  color: white;
+}
+
+.btn-warning:hover:not(:disabled) {
+  background: #d97706;
+}
+
 .btn-large {
   padding: 12px 24px;
   font-size: 16px;
+}
+
+.btn-small {
+  padding: 4px 10px;
+  font-size: 16px;
+  background: #475569;
+  color: white;
+  font-weight: 600;
+}
+
+.btn-small:hover:not(:disabled) {
+  background: #64748b;
+}
+
+.speed-control {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 10px;
+  background: rgba(51, 65, 85, 0.5);
+  border-radius: 6px;
+}
+
+.speed-display {
+  font-size: 13px;
+  font-weight: 600;
+  color: #fbbf24;
+  min-width: 48px;
+  text-align: center;
 }
 
 .checkbox-label {
@@ -398,6 +661,63 @@ const exportMidi = async () => {
 .stat-item.total {
   background: rgba(59, 130, 246, 0.2);
   color: #60a5fa;
+}
+
+.progress-bar-container {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 24px;
+  background: #1e293b;
+  border-bottom: 1px solid #334155;
+  flex-shrink: 0;
+}
+
+.progress-time {
+  font-size: 12px;
+  font-weight: 500;
+  color: #94a3b8;
+  min-width: 45px;
+  text-align: center;
+}
+
+.progress-bar {
+  flex: 1;
+  height: 6px;
+  background: #334155;
+  border-radius: 3px;
+  position: relative;
+  cursor: pointer;
+  transition: height 0.2s;
+}
+
+.progress-bar:hover {
+  height: 8px;
+}
+
+.progress-fill {
+  height: 100%;
+  background: linear-gradient(90deg, #3b82f6, #8b5cf6);
+  border-radius: 3px;
+  transition: width 0.1s linear;
+}
+
+.progress-handle {
+  position: absolute;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  width: 14px;
+  height: 14px;
+  background: #ffffff;
+  border: 2px solid #3b82f6;
+  border-radius: 50%;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.3);
+  opacity: 0;
+  transition: opacity 0.2s;
+}
+
+.progress-bar:hover .progress-handle {
+  opacity: 1;
 }
 
 .main-content {

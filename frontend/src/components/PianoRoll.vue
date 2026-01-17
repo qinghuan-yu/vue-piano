@@ -29,10 +29,18 @@ const props = defineProps({
   duration: {
     type: Number,
     default: 0
+  },
+  currentTime: {
+    type: Number,
+    default: 0
+  },
+  isPlaying: {
+    type: Boolean,
+    default: false
   }
 })
 
-const emit = defineEmits(['update:notes'])
+const emit = defineEmits(['update:notes', 'play-note'])
 
 // Canvas 引用
 const canvasRef = ref(null)
@@ -106,6 +114,11 @@ const render = () => {
   
   // 绘制音符
   drawNotes()
+  
+  // 绘制播放进度条
+  if (props.currentTime > 0) {
+    drawProgressLine()
+  }
   
   // 绘制框选区域
   if (isDragging.value) {
@@ -208,6 +221,71 @@ const drawNote = (note, isSelected) => {
 }
 
 /**
+ * 绘制播放进度条
+ */
+const drawProgressLine = () => {
+  const x = timeToX(props.currentTime)
+  
+  // 只在可见区域内绘制
+  if (x < 0 || x > VIEW.width) return
+  
+  // 绘制已播放区域的半透明遮罩
+  ctx.fillStyle = 'rgba(239, 68, 68, 0.08)'
+  ctx.fillRect(0, 0, x, VIEW.height)
+  
+  // 绘制进度线（带阴影效果）
+  ctx.save()
+  ctx.shadowColor = 'rgba(239, 68, 68, 0.5)'
+  ctx.shadowBlur = 8
+  ctx.strokeStyle = '#ef4444'  // 红色
+  ctx.lineWidth = 3
+  ctx.setLineDash([])
+  ctx.beginPath()
+  ctx.moveTo(x, 0)
+  ctx.lineTo(x, VIEW.height)
+  ctx.stroke()
+  ctx.restore()
+  
+  // 绘制顶部三角形标记
+  ctx.fillStyle = '#ef4444'
+  ctx.beginPath()
+  ctx.moveTo(x, 0)
+  ctx.lineTo(x - 8, 15)
+  ctx.lineTo(x + 8, 15)
+  ctx.closePath()
+  ctx.fill()
+  
+  // 绘制底部三角形标记
+  ctx.beginPath()
+  ctx.moveTo(x, VIEW.height)
+  ctx.lineTo(x - 8, VIEW.height - 15)
+  ctx.lineTo(x + 8, VIEW.height - 15)
+  ctx.closePath()
+  ctx.fill()
+  
+  // 绘制时间标签
+  const mins = Math.floor(props.currentTime / 60)
+  const secs = Math.floor(props.currentTime % 60)
+  const timeText = `${mins}:${secs.toString().padStart(2, '0')}`
+  
+  ctx.font = 'bold 12px monospace'
+  ctx.textAlign = 'center'
+  ctx.textBaseline = 'top'
+  
+  // 时间标签背景
+  const textWidth = ctx.measureText(timeText).width
+  const labelX = Math.min(Math.max(x, textWidth / 2 + 5), VIEW.width - textWidth / 2 - 5)
+  const labelY = 20
+  
+  ctx.fillStyle = 'rgba(239, 68, 68, 0.9)'
+  ctx.fillRect(labelX - textWidth / 2 - 4, labelY, textWidth + 8, 18)
+  
+  // 时间文字
+  ctx.fillStyle = '#ffffff'
+  ctx.fillText(timeText, labelX, labelY + 3)
+}
+
+/**
  * 绘制框选区域
  */
 const drawSelectionBox = () => {
@@ -304,8 +382,10 @@ const handleMouseDown = (e) => {
   const clickedNote = getNoteAtPosition(x, y)
   
   if (clickedNote && !e.shiftKey) {
-    // 单击音符：切换旋律状态
+    // 单击音符：切换旋律状态并播放该音符
     toggleNoteMelody(clickedNote.id)
+    // 触发播放音符事件
+    emit('play-note', clickedNote.pitch, clickedNote.velocity, 0.3)
   } else {
     // 开始框选
     isDragging.value = true
@@ -360,13 +440,13 @@ const handleWheel = (e) => {
     VIEW.pixelsPerSecond *= zoomFactor
     VIEW.pixelsPerSecond = Math.max(20, Math.min(500, VIEW.pixelsPerSecond))
   } else if (e.shiftKey) {
-    // Shift + 滚轮：水平平移
-    VIEW.offsetX += e.deltaY
-    VIEW.offsetX = Math.max(0, VIEW.offsetX)
-  } else {
-    // 普通滚轮：垂直平移
+    // Shift + 滚轮：垂直平移
     VIEW.offsetY += e.deltaY
     VIEW.offsetY = Math.max(0, VIEW.offsetY)
+  } else {
+    // 普通滚轮：水平平移（左右滑动）
+    VIEW.offsetX += e.deltaY
+    VIEW.offsetX = Math.max(0, VIEW.offsetX)
   }
   
   render()
@@ -417,6 +497,33 @@ const setSelectedAsAccompaniment = () => {
 watch(() => props.notes, () => {
   render()
 }, { deep: true })
+
+// 监听播放进度，自动滚动
+watch(() => props.currentTime, (newTime, oldTime) => {
+  if (props.isPlaying && newTime > 0) {
+    autoScroll(newTime)
+  }
+  // 当播放停止并重置到开头时，滚动回起始位置
+  if (newTime === 0 && oldTime > 0 && !props.isPlaying) {
+    VIEW.offsetX = 0
+  }
+  render()
+})
+
+/**
+ * 自动滚动以跟随播放进度
+ */
+const autoScroll = (currentTime) => {
+  const progressX = timeToX(currentTime)
+  const viewportCenter = VIEW.width / 2
+  
+  // 当进度条超过视口中心位置时，开始滚动
+  if (progressX > viewportCenter) {
+    // 让进度条保持在视口中心偏左的位置
+    const targetOffsetX = currentTime * VIEW.pixelsPerSecond - viewportCenter + 100
+    VIEW.offsetX = Math.max(0, targetOffsetX)
+  }
+}
 
 // 生命周期
 onMounted(() => {
