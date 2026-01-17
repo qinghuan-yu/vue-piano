@@ -9,6 +9,15 @@
       @wheel="handleWheel"
     ></canvas>
     
+    <!-- 垂直滚动条 -->
+    <div class="vertical-scrollbar">
+      <div 
+        class="scrollbar-thumb"
+        :style="scrollbarThumbStyle"
+        @mousedown="handleScrollbarMouseDown"
+      ></div>
+    </div>
+    
     <!-- 信息提示 -->
     <div class="info-panel" v-if="selectedNotes.length > 0">
       <p>已选择 {{ selectedNotes.length }} 个音符</p>
@@ -49,7 +58,7 @@ let ctx = null
 // 视图参数
 const VIEW = {
   pixelsPerSecond: 100, // 每秒对应的像素数
-  pixelsPerPitch: 8,    // 每个音高对应的像素数
+  pixelsPerPitch: 12,   // 每个音高对应的像素数（从8增加到12）
   minPitch: 21,         // 最低音 A0
   maxPitch: 108,        // 最高音 C8
   offsetX: 0,           // 水平偏移
@@ -64,6 +73,10 @@ const dragStart = ref({ x: 0, y: 0 })
 const dragEnd = ref({ x: 0, y: 0 })
 const selectedNotes = ref([])
 
+// 滚动条状态
+const isScrollbarDragging = ref(false)
+const scrollbarDragStart = ref(0)
+
 // 颜色配置
 const COLORS = {
   melody: '#4ade80',      // 亮绿色
@@ -77,6 +90,35 @@ const COLORS = {
 
 // 黑键音高集合 (C#, D#, F#, G#, A#)
 const BLACK_KEYS = new Set([1, 3, 6, 8, 10])
+
+// 计算滚动条样式
+const scrollbarThumbStyle = ref({})
+
+const updateScrollbarThumbStyle = () => {
+  if (!VIEW.height) return
+  
+  // 总内容高度（所有音符的范围）
+  const totalContentHeight = (VIEW.maxPitch - VIEW.minPitch) * VIEW.pixelsPerPitch
+  
+  // 可视区域占总内容的比例
+  const visibleRatio = VIEW.height / totalContentHeight
+  
+  // 滚动条滑块高度（至少30px）
+  const thumbHeight = Math.max(30, VIEW.height * visibleRatio)
+  
+  // 当前滚动位置的比例
+  const maxOffsetY = totalContentHeight - VIEW.height
+  const scrollRatio = maxOffsetY > 0 ? VIEW.offsetY / maxOffsetY : 0
+  
+  // 滚动条滑块的top位置
+  const maxThumbTop = VIEW.height - thumbHeight
+  const thumbTop = maxThumbTop * scrollRatio
+  
+  scrollbarThumbStyle.value = {
+    height: `${thumbHeight}px`,
+    top: `${thumbTop}px`
+  }
+}
 
 /**
  * 初始化 Canvas
@@ -95,6 +137,7 @@ const initCanvas = () => {
   // 初始偏移：垂直方向居中在 C4 (MIDI 60) 附近
   VIEW.offsetY = (60 - VIEW.minPitch) * VIEW.pixelsPerPitch - VIEW.height / 2
   
+  updateScrollbarThumbStyle()
   render()
 }
 
@@ -442,7 +485,9 @@ const handleWheel = (e) => {
   } else if (e.shiftKey) {
     // Shift + 滚轮：垂直平移
     VIEW.offsetY += e.deltaY
-    VIEW.offsetY = Math.max(0, VIEW.offsetY)
+    const maxOffsetY = (VIEW.maxPitch - VIEW.minPitch) * VIEW.pixelsPerPitch - VIEW.height
+    VIEW.offsetY = Math.max(0, Math.min(maxOffsetY, VIEW.offsetY))
+    updateScrollbarThumbStyle()
   } else {
     // 普通滚轮：水平平移（左右滑动）
     VIEW.offsetX += e.deltaY
@@ -450,6 +495,50 @@ const handleWheel = (e) => {
   }
   
   render()
+}
+
+/**
+ * 滚动条鼠标按下事件
+ */
+const handleScrollbarMouseDown = (e) => {
+  e.preventDefault()
+  isScrollbarDragging.value = true
+  scrollbarDragStart.value = e.clientY
+  
+  // 添加全局鼠标事件监听
+  document.addEventListener('mousemove', handleScrollbarMouseMove)
+  document.addEventListener('mouseup', handleScrollbarMouseUp)
+}
+
+/**
+ * 滚动条拖动事件
+ */
+const handleScrollbarMouseMove = (e) => {
+  if (!isScrollbarDragging.value) return
+  
+  const deltaY = e.clientY - scrollbarDragStart.value
+  scrollbarDragStart.value = e.clientY
+  
+  // 计算滚动距离
+  const totalContentHeight = (VIEW.maxPitch - VIEW.minPitch) * VIEW.pixelsPerPitch
+  const maxOffsetY = totalContentHeight - VIEW.height
+  
+  // 滚动条移动比例转换为内容偏移
+  const scrollRatio = deltaY / VIEW.height
+  VIEW.offsetY += scrollRatio * totalContentHeight
+  VIEW.offsetY = Math.max(0, Math.min(maxOffsetY, VIEW.offsetY))
+  
+  updateScrollbarThumbStyle()
+  render()
+}
+
+/**
+ * 滚动条鼠标释放事件
+ */
+const handleScrollbarMouseUp = () => {
+  isScrollbarDragging.value = false
+  document.removeEventListener('mousemove', handleScrollbarMouseMove)
+  document.removeEventListener('mouseup', handleScrollbarMouseUp)
 }
 
 /**
@@ -564,6 +653,34 @@ onUnmounted(() => {
 canvas {
   display: block;
   cursor: crosshair;
+}
+
+/* 垂直滚动条 */
+.vertical-scrollbar {
+  position: absolute;
+  top: 0;
+  right: 0;
+  width: 12px;
+  height: 100%;
+  background: rgba(15, 23, 42, 0.8);
+  border-left: 1px solid #334155;
+}
+
+.scrollbar-thumb {
+  position: absolute;
+  width: 100%;
+  background: #64748b;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 0.2s;
+}
+
+.scrollbar-thumb:hover {
+  background: #94a3b8;
+}
+
+.scrollbar-thumb:active {
+  background: #cbd5e1;
 }
 
 .info-panel {

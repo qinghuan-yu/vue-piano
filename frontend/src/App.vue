@@ -131,7 +131,7 @@
 </template>
 
 <script setup>
-import { ref, computed, watch } from 'vue'
+import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
 import axios from 'axios'
 import * as Tone from 'tone'
 import PianoRoll from './components/PianoRoll.vue'
@@ -485,6 +485,24 @@ watch(soloMode, (newValue, oldValue) => {
     stopPlayback(false)
     startPlayback()
   }
+})
+
+// 键盘快捷键：空格键切换播放/暂停
+const handleKeyPress = (event) => {
+  // 空格键切换播放状态
+  if (event.code === 'Space' && midiData.value) {
+    event.preventDefault() // 阻止页面滚动
+    togglePlay()
+  }
+}
+
+// 生命周期：添加和移除键盘监听
+onMounted(() => {
+  window.addEventListener('keydown', handleKeyPress)
+})
+
+onUnmounted(() => {
+  window.removeEventListener('keydown', handleKeyPress)
 })
 </script>
 

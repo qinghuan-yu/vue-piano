@@ -239,16 +239,16 @@ async def upload_midi(file: UploadFile = File(...)):
 @app.post("/export")
 async def export_midi(request: ExportRequest):
     """
-    导出分轨后的 MIDI 文件（旋律 + 伴奏）
+    导出分轨后的 MIDI 文件（旋律 + 原始MIDI）
     """
     try:
         # 创建两个 MIDI 对象
         melody_midi = pretty_midi.PrettyMIDI()
-        accompaniment_midi = pretty_midi.PrettyMIDI()
+        original_midi = pretty_midi.PrettyMIDI()
         
         # 创建乐器轨道
         melody_instrument = pretty_midi.Instrument(program=0, name="Melody")
-        accompaniment_instrument = pretty_midi.Instrument(program=0, name="Accompaniment")
+        original_instrument = pretty_midi.Instrument(program=0, name="Piano")
         
         # 分配音符到不同轨道
         for note_data in request.notes:
@@ -259,14 +259,22 @@ async def export_midi(request: ExportRequest):
                 end=note_data.end
             )
             
+            # 旋律轨道：仅包含标记为旋律的音符
             if note_data.is_melody:
                 melody_instrument.notes.append(note)
-            else:
-                accompaniment_instrument.notes.append(note)
+            
+            # 原始轨道：包含所有音符
+            original_note = pretty_midi.Note(
+                velocity=note_data.velocity,
+                pitch=note_data.pitch,
+                start=note_data.start,
+                end=note_data.end
+            )
+            original_instrument.notes.append(original_note)
         
         # 添加乐器到 MIDI
         melody_midi.instruments.append(melody_instrument)
-        accompaniment_midi.instruments.append(accompaniment_instrument)
+        original_midi.instruments.append(original_instrument)
         
         # 创建 ZIP 文件
         zip_buffer = io.BytesIO()
@@ -276,10 +284,10 @@ async def export_midi(request: ExportRequest):
             melody_midi.write(melody_buffer)
             zip_file.writestr('melody.mid', melody_buffer.getvalue())
             
-            # 写入伴奏 MIDI
-            accompaniment_buffer = io.BytesIO()
-            accompaniment_midi.write(accompaniment_buffer)
-            zip_file.writestr('accompaniment.mid', accompaniment_buffer.getvalue())
+            # 写入原始 MIDI
+            original_buffer = io.BytesIO()
+            original_midi.write(original_buffer)
+            zip_file.writestr('original.mid', original_buffer.getvalue())
         
         # 重置指针
         zip_buffer.seek(0)
