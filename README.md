@@ -1,4 +1,4 @@
-# Animenz-Melody-Annotator
+# A-Melody-Annotator
 
 A powerful web tool for automatically identifying and manually annotating main melodies from complex piano MIDI files.
 

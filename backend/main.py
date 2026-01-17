@@ -1,5 +1,5 @@
 """
-Animenz-Melody-Annotator Backend
+Melody-Annotator Backend
 使用 FastAPI + pretty_midi 实现 MIDI 旋律分离
 """
 from fastapi import FastAPI, File, UploadFile, HTTPException
@@ -14,7 +14,7 @@ import io
 import zipfile
 from pydantic import BaseModel
 
-app = FastAPI(title="Animenz Melody Annotator API")
+app = FastAPI(title="Melody Annotator API")
 
 # 配置 CORS
 app.add_middleware(
@@ -183,7 +183,7 @@ def skyline_algorithm(notes: List[Dict], time_window: float = 0.05) -> List[Dict
 @app.get("/")
 async def root():
     """健康检查"""
-    return {"message": "Animenz Melody Annotator API is running"}
+    return {"message": "Melody Annotator API is running"}
 
 
 @app.post("/upload")

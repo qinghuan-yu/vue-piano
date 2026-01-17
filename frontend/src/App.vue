@@ -3,7 +3,7 @@
     <!-- 顶部控制栏 -->
     <header class="control-bar">
       <div class="logo">
-        <h1>🎹 Animenz Melody Annotator</h1>
+        <h1>🎹 Melody Annotator</h1>
       </div>
       
       <div class="controls">
@@ -97,7 +97,7 @@
     <main class="main-content">
       <div v-if="!midiData" class="empty-state">
         <div class="empty-icon">🎼</div>
-        <h2>欢迎使用 Animenz Melody Annotator</h2>
+        <h2>欢迎使用 Melody Annotator</h2>
         <p>请上传一个 MIDI 文件开始标注主旋律</p>
         <label class="btn btn-primary btn-large">
           <input 
@@ -111,6 +111,7 @@
       </div>
       
       <PianoRoll 
+        ref="pianoRollRef"
         v-else
         :notes="midiData.notes"
         :duration="midiData.duration"
@@ -170,6 +171,9 @@ let scheduledNotes = []
 let progressInterval = null
 let startTime = 0
 
+// PianoRoll 组件引用
+const pianoRollRef = ref(null)
+
 // 计算属性：播放进度百分比
 const progressPercent = computed(() => {
   if (!midiData.value || !midiData.value.duration) return 0
@@ -219,7 +223,6 @@ const handleFileUpload = async (event) => {
     })
     
     midiData.value = response.data
-    console.log('MIDI 数据加载成功:', response.data)
   } catch (error) {
     console.error('上传失败:', error)
     alert('上传失败：' + (error.response?.data?.detail || error.message))
@@ -259,24 +262,16 @@ const togglePlay = async () => {
 const startPlayback = async () => {
   try {
     await Tone.start()
-    console.log('🎵 Tone.js started')
-    
     initSynth()
     
     isPlaying.value = true
     startTime = Tone.now()
     const resumeFrom = pausedTime.value
     
-    console.log(`▶️ Starting playback from ${resumeFrom.toFixed(2)}s, speed: ${playbackSpeed.value}x`)
-    console.log(`🎚️ Solo Mode: ${soloMode.value}`)
-    
     // 筛选要播放的音符
     const notesToPlay = soloMode.value 
       ? midiData.value.notes.filter(n => n.is_melody)
       : midiData.value.notes
-    
-    console.log(`🎼 Total notes to play: ${notesToPlay.length}`)
-    console.log(`📊 Original notes: ${midiData.value.notes.length}, Melody: ${midiData.value.notes.filter(n => n.is_melody).length}, Accomp: ${midiData.value.notes.filter(n => !n.is_melody).length}`)
     
     // 直接调度所有音符（不使用Transport）
     let scheduledCount = 0
@@ -298,12 +293,9 @@ const startPlayback = async () => {
       }
     })
     
-    console.log(`✅ Scheduled ${scheduledCount} notes`)
-    
     // 播放完成后停止
     const remainingDuration = (midiData.value.duration - resumeFrom) / playbackSpeed.value
     Tone.Transport.scheduleOnce(() => {
-      console.log('🛑 Playback complete')
       stopPlayback(true)
     }, `+${remainingDuration}`)
     
@@ -316,9 +308,8 @@ const startPlayback = async () => {
     }, 50)
     
     Tone.Transport.start()
-    console.log('🚀 Transport started')
   } catch (error) {
-    console.error('❌ Playback error:', error)
+    console.error('播放错误:', error)
     isPlaying.value = false
   }
 }
@@ -327,8 +318,6 @@ const startPlayback = async () => {
  * 停止播放
  */
 const stopPlayback = (isComplete = false) => {
-  console.log(`⏸️ Stopping playback, complete: ${isComplete}`)
-  
   isPlaying.value = false
   
   // 清除进度更新定时器
@@ -340,12 +329,10 @@ const stopPlayback = (isComplete = false) => {
   // 记录暂停位置
   if (!isComplete) {
     pausedTime.value = currentTime.value
-    console.log(`📍 Paused at ${pausedTime.value.toFixed(2)}s`)
   } else {
     // 播放完成，重置到开头
     pausedTime.value = 0
     currentTime.value = 0
-    console.log('🔄 Reset to start')
   }
   
   Tone.Transport.stop()
@@ -379,7 +366,6 @@ const playNote = (pitch, velocity = 80, duration = 0.3) => {
   const midiNote = Tone.Frequency(pitch, 'midi').toNote()
   const vel = velocity / 127
   synth.triggerAttackRelease(midiNote, duration, Tone.now(), vel)
-  console.log(`🎹 Playing note: ${midiNote} (pitch: ${pitch})`)
 }
 
 /**
@@ -394,6 +380,11 @@ const seekTo = (event) => {
   
   currentTime.value = newTime
   pausedTime.value = newTime
+  
+  // 同步滚动钢琴卷帘视图
+  if (pianoRollRef.value) {
+    pianoRollRef.value.scrollToTime(newTime)
+  }
   
   // 如果正在播放，重新开始
   if (isPlaying.value) {
@@ -427,8 +418,6 @@ const exportMidi = async () => {
     document.body.appendChild(link)
     link.click()
     link.remove()
-    
-    console.log('导出成功')
   } catch (error) {
     console.error('导出失败:', error)
     alert('导出失败：' + (error.response?.data?.detail || error.message))
@@ -460,7 +449,6 @@ const tokenizeMidi = async () => {
     })
     
     const result = response.data
-    console.log('🔤 Token化结果:', result)
     
     // 创建下载文件
     const tokenData = JSON.stringify(result, null, 2)
@@ -492,10 +480,8 @@ const tokenizeMidi = async () => {
 
 // 监听 Solo Mode 切换
 watch(soloMode, (newValue, oldValue) => {
-  console.log(`🎚️ Solo Mode changed: ${oldValue} → ${newValue}`)
   // 如果正在播放，重新开始以应用新的模式
   if (isPlaying.value) {
-    console.log('🔄 Restarting playback with new mode...')
     stopPlayback(false)
     startPlayback()
   }

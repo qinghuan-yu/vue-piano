@@ -236,9 +236,9 @@ const drawProgressLine = () => {
   // 绘制进度线（带阴影效果）
   ctx.save()
   ctx.shadowColor = 'rgba(239, 68, 68, 0.5)'
-  ctx.shadowBlur = 8
+  ctx.shadowBlur = 6
   ctx.strokeStyle = '#ef4444'  // 红色
-  ctx.lineWidth = 3
+  ctx.lineWidth = 2  // 从 3 改为 2，更细
   ctx.setLineDash([])
   ctx.beginPath()
   ctx.moveTo(x, 0)
@@ -524,6 +524,23 @@ const autoScroll = (currentTime) => {
     VIEW.offsetX = Math.max(0, targetOffsetX)
   }
 }
+
+/**
+ * 滚动到指定时间位置（供父组件调用）
+ */
+const scrollToTime = (time) => {
+  const targetX = time * VIEW.pixelsPerSecond
+  const viewportCenter = VIEW.width / 2
+  
+  // 让目标时间显示在视口中心偏左位置
+  VIEW.offsetX = Math.max(0, targetX - viewportCenter + 100)
+  render()
+}
+
+// 暴露方法给父组件
+defineExpose({
+  scrollToTime
+})
 
 // 生命周期
 onMounted(() => {
