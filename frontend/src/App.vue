@@ -348,12 +348,14 @@ const handleTokensUpload = async (event) => {
         
         // 收集所有切片的音符，并调整时间
         for (const sample of jsonData.samples) {
-          const response = await axios.post(`${API_BASE}/tokens_to_notes`, {
+          // 使用target_only接口，只提取Target部分（完整编曲）
+          // 避免Source+Target导致时长翻倍
+          const response = await axios.post(`${API_BASE}/tokens_to_notes_target_only`, {
             training_sequence: sample.training_sequence,
-            time_quantization: jsonData.time_quantization_ms || 100
+            time_quantization: jsonData.time_quantization_ms || 10
           })
           
-          // 调整音符时间：加上切片起始时间
+          // 调整音符时间：加上切片起始时间（绝对时间偏移）
           const adjustedNotes = response.data.notes.map(note => ({
             ...note,
             start: note.start + sample.start_time,
@@ -376,7 +378,7 @@ const handleTokensUpload = async (event) => {
         
         const response = await axios.post(`${API_BASE}/tokens_to_notes`, {
           training_sequence: jsonData.samples[sampleIndex].training_sequence,
-          time_quantization: jsonData.time_quantization_ms || 100
+          time_quantization: jsonData.time_quantization_ms || 10
         })
         
         notesData = response.data.notes
@@ -386,7 +388,7 @@ const handleTokensUpload = async (event) => {
       // 单一Token格式
       const response = await axios.post(`${API_BASE}/tokens_to_notes`, {
         training_sequence: jsonData.training_sequence,
-        time_quantization: jsonData.time_quantization_ms || 100
+        time_quantization: jsonData.time_quantization_ms || 10
       })
       
       notesData = response.data.notes
@@ -633,7 +635,7 @@ const tokenizeMidi = async () => {
     const response = await axios.post(`${API_BASE}/tokenize`, {
       notes: midiData.value.notes,
       duration: midiData.value.duration,
-      time_quantization: 100  // 100ms 量化
+      time_quantization: 10  // 10ms 量化 - 提高精度保留快速音符
     })
     
     const result = response.data
@@ -697,7 +699,7 @@ const tokenizeMidiSliced = async () => {
     const response = await axios.post(`${API_BASE}/tokenize_sliced`, {
       notes: midiData.value.notes,
       duration: midiData.value.duration,
-      time_quantization: 100,  // 100ms 量化
+      time_quantization: 10,  // 10ms精度  // 100ms 量化
       slice_duration: duration,
       overlap: 0  // 无重叠
     })

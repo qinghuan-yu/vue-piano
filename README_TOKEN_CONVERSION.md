@@ -126,7 +126,7 @@ Token 序列使用纯数字格式：
 ```python
 class TokensToMidiRequest(BaseModel):
     training_sequence: List[int]
-    time_quantization: int = 100
+    time_quantization: int = 10
     filename: str = "output.mid"
 ```
 

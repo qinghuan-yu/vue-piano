@@ -52,7 +52,7 @@ class TokenizeRequest(BaseModel):
     """Token化请求模型"""
     notes: List[Note]
     duration: float
-    time_quantization: int = 100  # 时间量化单位（毫秒）
+    time_quantization: int = 10  # 时间量化单位（毫秒）- 提高精度以保留快速音符细节
 
 
 class JsonToMidiRequest(BaseModel):
@@ -64,7 +64,7 @@ class JsonToMidiRequest(BaseModel):
 class TokensToMidiRequest(BaseModel):
     """Token序列转MIDI请求模型"""
     training_sequence: List[int]
-    time_quantization: int = 100
+    time_quantization: int = 10
     filename: str = "output.mid"
 
 
@@ -72,7 +72,7 @@ class TokenizeSlicedRequest(BaseModel):
     """切片Token化请求模型"""
     notes: List[Note]
     duration: float
-    time_quantization: int = 100  # 时间量化单位（毫秒）
+    time_quantization: int = 10  # 时间量化单位（毫秒）- 10ms精度保留快速音符
     slice_duration: float = 8.0  # 每个切片的时长（秒）
     overlap: float = 0.0  # 切片之间的重叠时间（秒）
 
@@ -103,9 +103,50 @@ def slice_notes_by_time(notes: List[Dict], start_time: float, end_time: float) -
     return sliced_notes
 
 
-def tokens_to_notes(tokens: List[int], time_quantization: int = 100) -> List[Dict]:
+def extract_target_tokens(training_sequence: List[int]) -> List[int]:
     """
-    将Token序列逆转换为MIDI音符列表
+    从training_sequence中只提取Target部分
+    
+    training_sequence格式: [1] + Source + [2] + Target + [3]
+    返回: Target部分 (不包含SEP和EOS)
+    
+    Args:
+        training_sequence: 完整的训练序列
+    
+    Returns:
+        只包含Target的token序列
+    """
+    try:
+        # 找到SEP (Token ID=2)的位置
+        sep_index = training_sequence.index(2)
+        
+        # 提取SEP之后的部分
+        target_tokens = training_sequence[sep_index + 1:]
+        
+        # 去掉末尾的EOS (Token ID=3)
+        if target_tokens and target_tokens[-1] == 3:
+            target_tokens = target_tokens[:-1]
+        
+        return target_tokens
+    except ValueError:
+        # 如果没有SEP，返回整个序列（去掉BOS和EOS）
+        result = training_sequence[:]
+        if result and result[0] == 1:  # 去掉BOS
+            result = result[1:]
+        if result and result[-1] == 3:  # 去掉EOS
+            result = result[:-1]
+        return result
+
+
+def tokens_to_notes(tokens: List[int], time_quantization: int = 10) -> List[Dict]:
+    """
+    将Token序列逆转换为MIDI音符列表（修复版）
+    
+    修复内容：
+    1. 同音覆盖保护：同一音高连续NOTE_ON时，自动关闭上一个音符
+    2. 零时长保护：强制最小持续时间，防止duration=0的音符
+    3. 残余音符清理：序列结束时关闭所有未关闭的音符
+    4. TIME token鲁棒性：处理异常的时间参数
     
     Token编码：
     - 1: <BOS>
@@ -119,7 +160,7 @@ def tokens_to_notes(tokens: List[int], time_quantization: int = 100) -> List[Dic
     
     Args:
         tokens: Token序列
-        time_quantization: 时间量化单位（毫秒）
+        time_quantization: 时间量化单位（毫秒），默认10ms以保留快速音符细节
     
     Returns:
         音符列表
@@ -128,6 +169,9 @@ def tokens_to_notes(tokens: List[int], time_quantization: int = 100) -> List[Dic
     active_notes = {}  # {pitch: {'start': time, 'is_melody': bool}}
     current_time = 0.0
     note_id = 0
+    
+    # 定义最小持续时间（秒），防止生成时长为0的音符
+    MIN_DURATION = time_quantization / 1000.0 * 0.5
     
     i = 0
     while i < len(tokens):
@@ -138,70 +182,83 @@ def tokens_to_notes(tokens: List[int], time_quantization: int = 100) -> List[Dic
             i += 1
             continue
         
-        # TIME事件
+        # -------------------------------------------------------
+        # 1. TIME事件
+        # -------------------------------------------------------
         if token == 0:
             if i + 1 < len(tokens):
-                time_delta = tokens[i + 1]
-                current_time += (time_delta * time_quantization) / 1000.0
-                i += 2
+                val = tokens[i + 1]
+                # 【鲁棒性保护】如果后面跟的不是时间数值，而是其他命令
+                # 假设event ID都在10以上，时间偏移通常较小
+                if val in [10, 11, 20, 21]:
+                    time_delta = 0
+                    i += 1
+                else:
+                    time_delta = val
+                    current_time += (time_delta * time_quantization) / 1000.0
+                    i += 2
             else:
                 i += 1
         
-        # NOTE_ON (旋律)
-        elif token == 10:
+        # -------------------------------------------------------
+        # 2. NOTE_ON (旋律=10, 伴奏=20)
+        # -------------------------------------------------------
+        elif token in [10, 20]:
+            is_melody = (token == 10)
             if i + 1 < len(tokens):
                 pitch = tokens[i + 1]
+                
+                # 【修复1：同音覆盖保护】
+                # 如果这个音高已经在active_notes里了，说明上一个音没关掉
+                # 强制把它关掉，作为上一个音的结束，再开始新音
+                if pitch in active_notes:
+                    prev_note = active_notes.pop(pitch)
+                    start_t = prev_note['start']
+                    end_t = current_time
+                    # 只有当时长 > 0 时才保存，避免完全重叠的脏数据
+                    if end_t > start_t:
+                        notes.append({
+                            'id': note_id,
+                            'start': start_t,
+                            'end': end_t,
+                            'pitch': pitch,
+                            'velocity': 80,
+                            'is_melody': prev_note['is_melody']
+                        })
+                        note_id += 1
+                
+                # 记录新音符开始
                 active_notes[pitch] = {
                     'start': current_time,
-                    'is_melody': True
+                    'is_melody': is_melody
                 }
                 i += 2
             else:
                 i += 1
         
-        # NOTE_OFF (旋律)
-        elif token == 11:
+        # -------------------------------------------------------
+        # 3. NOTE_OFF (旋律=11, 伴奏=21)
+        # -------------------------------------------------------
+        elif token in [11, 21]:
+            # 不区分Melody Off还是Accomp Off，只要pitch对上了就关
             if i + 1 < len(tokens):
                 pitch = tokens[i + 1]
                 if pitch in active_notes:
                     note_info = active_notes.pop(pitch)
+                    start_t = note_info['start']
+                    end_t = current_time
+                    
+                    # 【修复2：最小时长保护】
+                    # 如果start == end，强制给它加一点点长度
+                    if end_t <= start_t:
+                        end_t = start_t + MIN_DURATION
+                    
                     notes.append({
                         'id': note_id,
-                        'start': note_info['start'],
-                        'end': current_time,
+                        'start': start_t,
+                        'end': end_t,
                         'pitch': pitch,
-                        'velocity': 80,  # 默认力度
-                        'is_melody': note_info['is_melody']
-                    })
-                    note_id += 1
-                i += 2
-            else:
-                i += 1
-        
-        # NOTE_ON (伴奏)
-        elif token == 20:
-            if i + 1 < len(tokens):
-                pitch = tokens[i + 1]
-                active_notes[pitch] = {
-                    'start': current_time,
-                    'is_melody': False
-                }
-                i += 2
-            else:
-                i += 1
-        
-        # NOTE_OFF (伴奏)
-        elif token == 21:
-            if i + 1 < len(tokens):
-                pitch = tokens[i + 1]
-                if pitch in active_notes:
-                    note_info = active_notes.pop(pitch)
-                    notes.append({
-                        'id': note_id,
-                        'start': note_info['start'],
-                        'end': current_time,
-                        'pitch': pitch,
-                        'velocity': 80,  # 默认力度
+                        'velocity': 80,
                         'is_melody': note_info['is_melody']
                     })
                     note_id += 1
@@ -213,10 +270,31 @@ def tokens_to_notes(tokens: List[int], time_quantization: int = 100) -> List[Dic
             # 未知token，跳过
             i += 1
     
+    # 【修复3：清理残余音符】
+    # 如果序列结束了，active_notes里还有没关掉的音符
+    # 强制在current_time关闭
+    for pitch, info in active_notes.items():
+        start_t = info['start']
+        end_t = current_time
+        if end_t <= start_t:
+            end_t = start_t + MIN_DURATION
+        
+        notes.append({
+            'id': note_id,
+            'start': start_t,
+            'end': end_t,
+            'pitch': pitch,
+            'velocity': 80,
+            'is_melody': info['is_melody']
+        })
+        note_id += 1
+    
+    # 最后按开始时间排序
+    notes.sort(key=lambda x: x['start'])
     return notes
 
 
-def midi_to_tokens(notes: List[Dict], duration: float, time_quantization: int = 100, 
+def midi_to_tokens(notes: List[Dict], duration: float, time_quantization: int = 10, 
                    start_time: float = 0.0, end_time: float = None) -> Dict[str, List[int]]:
     """
     将 MIDI 音符转换为训练用的 Token 序列（纯数字格式）
@@ -238,7 +316,7 @@ def midi_to_tokens(notes: List[Dict], duration: float, time_quantization: int = 
     Args:
         notes: 音符列表
         duration: MIDI 总时长
-        time_quantization: 时间量化单位（毫秒）
+        time_quantization: 时间量化单位（毫秒），默认10ms提供更高精度
         start_time: 切片开始时间（用于切片）
         end_time: 切片结束时间（用于切片）
     
@@ -710,6 +788,39 @@ async def tokens_to_notes_endpoint(request: TokensToMidiRequest):
         return {
             "notes": notes,
             "count": len(notes)
+        }
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Token解析时出错: {str(e)}")
+
+
+@app.post("/tokens_to_notes_target_only")
+async def tokens_to_notes_target_only(request: TokensToMidiRequest):
+    """
+    只提取Target部分并转换为音符列表
+    
+    用于切片合并时只取完整编曲部分，避免Source+Target导致时长翻倍
+    
+    training_sequence格式: [1] Source [2] Target [3]
+    本接口只返回Target部分的音符
+    """
+    try:
+        # 提取Target部分
+        target_tokens = extract_target_tokens(request.training_sequence)
+        
+        if not target_tokens:
+            raise HTTPException(status_code=400, detail="无法从训练序列中提取Target部分")
+        
+        # 转换为音符
+        notes = tokens_to_notes(target_tokens, request.time_quantization)
+        
+        if not notes:
+            raise HTTPException(status_code=400, detail="无法从Token序列中解析出有效音符")
+        
+        return {
+            "notes": notes,
+            "count": len(notes),
+            "target_token_count": len(target_tokens)
         }
     
     except Exception as e:
