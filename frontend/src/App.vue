@@ -47,14 +47,14 @@
         </div>
         
         <!-- Solo 模式 -->
-        <label class="checkbox-label">
-          <input 
-            type="checkbox" 
-            v-model="soloMode"
-            :disabled="!midiData"
-          />
-          <span>Solo Melody</span>
-        </label>
+        <button 
+          class="btn btn-toggle" 
+          :class="{ active: soloMode }"
+          @click="soloMode = !soloMode"
+          :disabled="!midiData"
+        >
+          {{ soloMode ? '🎵' : '🎹' }} Solo {{ soloMode ? 'ON' : 'OFF' }}
+        </button>
         
         <!-- 导出按钮 -->
         <button 
@@ -73,6 +73,37 @@
         >
           🔤 转Token
         </button>
+        
+        <!-- 切片Token化按钮 -->
+        <button 
+          class="btn btn-success" 
+          @click="tokenizeMidiSliced"
+          :disabled="!midiData"
+        >
+          ✂️ 切片Token
+        </button>
+        
+        <!-- JSON转MIDI按钮 -->
+        <label class="btn btn-info">
+          <input 
+            type="file" 
+            accept=".json" 
+            @change="handleJsonUpload"
+            style="display: none"
+          />
+          📤 JSON→MIDI
+        </label>
+        
+        <!-- Token转MIDI按钮 -->
+        <label class="btn btn-info">
+          <input 
+            type="file" 
+            accept=".json" 
+            @change="handleTokensUpload"
+            style="display: none"
+          />
+          🔄 Token→MIDI
+        </label>
         
         <!-- 统计信息 -->
         <div class="stats" v-if="midiData">
@@ -138,6 +169,7 @@ import PianoRoll from './components/PianoRoll.vue'
 
 // 状态管理
 const midiData = ref(null)
+const originalFilename = ref('')
 const isLoading = ref(false)
 const loadingText = ref('处理中...')
 const isPlaying = ref(false)
@@ -211,6 +243,9 @@ const handleFileUpload = async (event) => {
   const file = event.target.files[0]
   if (!file) return
   
+  // 保存原始文件名（去掉扩展名）
+  originalFilename.value = file.name.replace(/\.[^/.]+$/, '')
+  
   isLoading.value = true
   loadingText.value = '正在分析 MIDI 文件...'
   
@@ -226,6 +261,162 @@ const handleFileUpload = async (event) => {
   } catch (error) {
     console.error('上传失败:', error)
     alert('上传失败：' + (error.response?.data?.detail || error.message))
+  } finally {
+    isLoading.value = false
+    event.target.value = '' // 重置文件输入
+  }
+}
+
+/**
+ * 处理JSON文件上传并转换为MIDI
+ */
+const handleJsonUpload = async (event) => {
+  const file = event.target.files[0]
+  if (!file) return
+  
+  isLoading.value = true
+  loadingText.value = '正在转换 JSON 为 MIDI...'
+  
+  try {
+    // 读取JSON文件
+    const fileContent = await file.text()
+    const jsonData = JSON.parse(fileContent)
+    
+    // 确保数据格式正确
+    const requestData = {
+      notes: jsonData.notes || [],
+      filename: jsonData.filename || 'converted.mid'
+    }
+    
+    // 发送到后端转换
+    const response = await axios.post(`${API_BASE}/json_to_midi`, requestData, {
+      responseType: 'blob'
+    })
+    
+    // 下载生成的MIDI文件
+    const url = window.URL.createObjectURL(new Blob([response.data]))
+    const link = document.createElement('a')
+    link.href = url
+    link.download = requestData.filename
+    document.body.appendChild(link)
+    link.click()
+    document.body.removeChild(link)
+    window.URL.revokeObjectURL(url)
+    
+    alert('✅ JSON 已成功转换为 MIDI 文件')
+  } catch (error) {
+    console.error('JSON转换失败:', error)
+    alert('JSON转换失败：' + (error.response?.data?.detail || error.message || '请检查JSON格式'))
+  } finally {
+    isLoading.value = false
+    event.target.value = '' // 重置文件输入
+  }
+}
+
+/**
+ * 处理Token JSON文件上传并转换为MIDI
+ */
+const handleTokensUpload = async (event) => {
+  const file = event.target.files[0]
+  if (!file) return
+  
+  isLoading.value = true
+  loadingText.value = '正在将 Token 转换为 MIDI...'
+  
+  try {
+    // 读取JSON文件
+    const fileContent = await file.text()
+    const jsonData = JSON.parse(fileContent)
+    
+    // 检查是否是切片Token格式
+    let notesData = []
+    let filename
+    
+    if (jsonData.samples && Array.isArray(jsonData.samples)) {
+      // 切片Token格式 - 询问用户是否拼接所有切片
+      if (jsonData.samples.length === 0) {
+        throw new Error('没有找到可用的训练样本')
+      }
+      
+      const shouldMerge = jsonData.samples.length > 1 && 
+        confirm(`找到 ${jsonData.samples.length} 个样本切片。\n\n点击"确定"将所有切片拼接为完整MIDI\n点击"取消"仅转换单个切片`)
+      
+      if (shouldMerge) {
+        // 拼接所有切片
+        isLoading.value = true
+        loadingText.value = `正在拼接 ${jsonData.samples.length} 个切片...`
+        
+        // 收集所有切片的音符，并调整时间
+        for (const sample of jsonData.samples) {
+          const response = await axios.post(`${API_BASE}/tokens_to_notes`, {
+            training_sequence: sample.training_sequence,
+            time_quantization: jsonData.time_quantization_ms || 100
+          })
+          
+          // 调整音符时间：加上切片起始时间
+          const adjustedNotes = response.data.notes.map(note => ({
+            ...note,
+            start: note.start + sample.start_time,
+            end: note.end + sample.start_time
+          }))
+          
+          notesData.push(...adjustedNotes)
+        }
+        
+        filename = 'merged_all_slices.mid'
+      } else {
+        // 转换单个切片
+        const sampleIndex = jsonData.samples.length === 1 ? 0 : 
+          parseInt(prompt(`请输入要转换的样本编号 (0-${jsonData.samples.length - 1})：`, '0'))
+        
+        if (isNaN(sampleIndex) || sampleIndex < 0 || sampleIndex >= jsonData.samples.length) {
+          alert('无效的样本编号')
+          return
+        }
+        
+        const response = await axios.post(`${API_BASE}/tokens_to_notes`, {
+          training_sequence: jsonData.samples[sampleIndex].training_sequence,
+          time_quantization: jsonData.time_quantization_ms || 100
+        })
+        
+        notesData = response.data.notes
+        filename = `sample_${sampleIndex}.mid`
+      }
+    } else if (jsonData.training_sequence) {
+      // 单一Token格式
+      const response = await axios.post(`${API_BASE}/tokens_to_notes`, {
+        training_sequence: jsonData.training_sequence,
+        time_quantization: jsonData.time_quantization_ms || 100
+      })
+      
+      notesData = response.data.notes
+      filename = 'converted.mid'
+    } else {
+      throw new Error('无法识别的Token格式，请确保JSON包含 training_sequence 或 samples 字段')
+    }
+    
+    // 使用音符数据生成MIDI
+    const response = await axios.post(`${API_BASE}/json_to_midi`, {
+      notes: notesData,
+      filename: filename
+    }, {
+      responseType: 'blob'
+    })
+    
+    // 下载生成的MIDI文件
+    const url = window.URL.createObjectURL(new Blob([response.data]))
+    const link = document.createElement('a')
+    link.href = url
+    link.download = filename
+    document.body.appendChild(link)
+    link.click()
+    document.body.removeChild(link)
+    window.URL.revokeObjectURL(url)
+    
+    alert('✅ Token 已成功转换为 MIDI 文件')
+  } catch (error) {
+    console.error('Token转换失败:', error)
+    alert('Token转换失败：' + (error.response?.data?.detail || error.message || '请检查Token格式'))
   } finally {
     isLoading.value = false
     event.target.value = '' // 重置文件输入
@@ -410,11 +601,14 @@ const exportMidi = async () => {
       responseType: 'blob'
     })
     
+    // 使用原始文件名或默认名称
+    const filename = originalFilename.value ? `${originalFilename.value}_separated.zip` : 'separated_midi.zip'
+    
     // 创建下载链接
     const url = window.URL.createObjectURL(new Blob([response.data]))
     const link = document.createElement('a')
     link.href = url
-    link.setAttribute('download', 'separated_midi.zip')
+    link.setAttribute('download', filename)
     document.body.appendChild(link)
     link.click()
     link.remove()
@@ -436,16 +630,10 @@ const tokenizeMidi = async () => {
   loadingText.value = '正在转换为 Token...'
   
   try {
-    // 让用户选择Token类型
-    const vocabType = confirm('选择 Token 格式:\n\n确定 = 复合格式 (如 "NOTE_ON_60_80_MELODY")\n取消 = 简单格式 (如 [1, 60, 80, 1])') 
-      ? 'compound' 
-      : 'simple'
-    
     const response = await axios.post(`${API_BASE}/tokenize`, {
       notes: midiData.value.notes,
       duration: midiData.value.duration,
-      time_quantization: 100,  // 100ms 量化
-      vocab_type: vocabType
+      time_quantization: 100  // 100ms 量化
     })
     
     const result = response.data
@@ -456,23 +644,118 @@ const tokenizeMidi = async () => {
     const url = window.URL.createObjectURL(blob)
     const link = document.createElement('a')
     link.href = url
-    link.setAttribute('download', `tokens_${vocabType}.json`)
+    link.setAttribute('download', 'tokens.json')
     document.body.appendChild(link)
     link.click()
     link.remove()
     
     // 显示统计信息
     alert(`✅ Token化完成!\n\n` +
-      `Token数量: ${result.token_count}\n` +
+      `训练序列长度: ${result.total_length}\n` +
+      `Source长度 (仅旋律): ${result.source_length}\n` +
+      `Target长度 (完整): ${result.target_length}\n` +
       `音符数量: ${result.note_count}\n` +
       `旋律音符: ${result.melody_count}\n` +
       `伴奏音符: ${result.accompaniment_count}\n` +
-      `格式: ${result.vocab_type}\n\n` +
-      `已保存到: tokens_${vocabType}.json`)
+      `时长: ${result.duration.toFixed(2)}秒\n\n` +
+      `Token编码:\n` +
+      `1=<BOS>, 2=<SEP>, 3=<EOS>\n` +
+      `0,time=TIME事件\n` +
+      `10,pitch=NOTE_ON(旋律)\n` +
+      `11,pitch=NOTE_OFF(旋律)\n` +
+      `20,pitch=NOTE_ON(伴奏)\n` +
+      `21,pitch=NOTE_OFF(伴奏)`)
     
   } catch (error) {
     console.error('Token化失败:', error)
     alert('Token化失败：' + (error.response?.data?.detail || error.message))
+  } finally {
+    isLoading.value = false
+  }
+}
+
+/**
+ * 切片Token化 MIDI 数据
+ */
+const tokenizeMidiSliced = async () => {
+  if (!midiData.value) return
+  
+  // 让用户选择切片时长
+  const sliceDuration = prompt('请输入每个切片的时长（秒）：', '8')
+  if (!sliceDuration) return
+  
+  const duration = parseFloat(sliceDuration)
+  if (isNaN(duration) || duration <= 0) {
+    alert('无效的时长值')
+    return
+  }
+  
+  isLoading.value = true
+  loadingText.value = '正在切片并转换为 Token...'
+  
+  try {
+    const response = await axios.post(`${API_BASE}/tokenize_sliced`, {
+      notes: midiData.value.notes,
+      duration: midiData.value.duration,
+      time_quantization: 100,  // 100ms 量化
+      slice_duration: duration,
+      overlap: 0  // 无重叠
+    })
+    
+    const result = response.data
+    
+    // 创建下载文件
+    const tokenData = JSON.stringify(result, null, 2)
+    const blob = new Blob([tokenData], { type: 'application/json' })
+    const url = window.URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.setAttribute('download', 'tokens_sliced.json')
+    document.body.appendChild(link)
+    link.click()
+    link.remove()
+    
+    // 显示统计信息
+    alert(`✅ 切片Token化完成!
+
+` +
+      `生成样本数: ${result.num_samples}
+` +
+      `切片时长: ${result.slice_duration}秒
+` +
+      `总时长: ${result.total_duration.toFixed(2)}秒
+` +
+      `平均样本长度: ${result.avg_sample_length} tokens
+` +
+      `最大样本长度: ${result.max_sample_length} tokens
+` +
+      `音符数量: ${result.note_count}
+` +
+      `旋律音符: ${result.melody_count}
+` +
+      `伴奏音符: ${result.accompaniment_count}
+
+` +
+      `Token编码:
+` +
+      `1=<BOS>, 2=<SEP>, 3=<EOS>
+` +
+      `0,time=TIME事件
+` +
+      `10,pitch=NOTE_ON(旋律)
+` +
+      `11,pitch=NOTE_OFF(旋律)
+` +
+      `20,pitch=NOTE_ON(伴奏)
+` +
+      `21,pitch=NOTE_OFF(伴奏)
+
+` +
+      `已保存到: tokens_sliced.json`)
+    
+  } catch (error) {
+    console.error('切片Token化失败:', error)
+    alert('切片Token化失败：' + (error.response?.data?.detail || error.message))
   } finally {
     isLoading.value = false
   }
@@ -591,6 +874,15 @@ onUnmounted(() => {
   background: #d97706;
 }
 
+.btn-info {
+  background: #0ea5e9;
+  color: white;
+}
+
+.btn-info:hover:not(:disabled) {
+  background: #0284c7;
+}
+
 .btn-large {
   padding: 12px 24px;
   font-size: 16px;
@@ -608,6 +900,24 @@ onUnmounted(() => {
   background: #64748b;
 }
 
+.btn-toggle {
+  background: #475569;
+  color: #cbd5e1;
+}
+
+.btn-toggle:hover:not(:disabled) {
+  background: #64748b;
+}
+
+.btn-toggle.active {
+  background: #10b981;
+  color: white;
+}
+
+.btn-toggle.active:hover:not(:disabled) {
+  background: #059669;
+}
+
 .speed-control {
   display: flex;
   align-items: center;
@@ -623,19 +933,6 @@ onUnmounted(() => {
   color: #fbbf24;
   min-width: 48px;
   text-align: center;
-}
-
-.checkbox-label {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  color: #e2e8f0;
-  font-size: 14px;
-  cursor: pointer;
-}
-
-.checkbox-label input[type="checkbox"] {
-  cursor: pointer;
 }
 
 .stats {

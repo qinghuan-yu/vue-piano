@@ -53,89 +53,277 @@ class TokenizeRequest(BaseModel):
     notes: List[Note]
     duration: float
     time_quantization: int = 100  # 时间量化单位（毫秒）
-    vocab_type: str = "compound"  # compound: 复合token, simple: 简单token
 
 
-def midi_to_tokens(notes: List[Dict], duration: float, time_quantization: int = 100, vocab_type: str = "compound") -> List:
+class JsonToMidiRequest(BaseModel):
+    """JSON转MIDI请求模型"""
+    notes: List[Note]
+    filename: str = "output.mid"
+
+
+class TokensToMidiRequest(BaseModel):
+    """Token序列转MIDI请求模型"""
+    training_sequence: List[int]
+    time_quantization: int = 100
+    filename: str = "output.mid"
+
+
+class TokenizeSlicedRequest(BaseModel):
+    """切片Token化请求模型"""
+    notes: List[Note]
+    duration: float
+    time_quantization: int = 100  # 时间量化单位（毫秒）
+    slice_duration: float = 8.0  # 每个切片的时长（秒）
+    overlap: float = 0.0  # 切片之间的重叠时间（秒）
+
+
+def slice_notes_by_time(notes: List[Dict], start_time: float, end_time: float) -> List[Dict]:
     """
-    将 MIDI 音符转换为 Token 序列
+    根据时间范围切片音符
     
-    支持两种 Token 化方式：
-    1. compound: 复合 token，格式如 [TIME_50, NOTE_ON_60_80, NOTE_OFF_60, ...]
-    2. simple: 简单 token，格式如 [50, 1, 60, 80, 2, 60, ...]
+    Args:
+        notes: 音符列表
+        start_time: 切片开始时间
+        end_time: 切片结束时间
+    
+    Returns:
+        在时间范围内的音符列表（时间已调整为相对于start_time）
+    """
+    sliced_notes = []
+    
+    for note in notes:
+        # 检查音符是否在时间范围内
+        if note['start'] < end_time and note['end'] > start_time:
+            # 调整音符时间为相对于切片开始时间
+            adjusted_note = note.copy()
+            adjusted_note['start'] = max(0, note['start'] - start_time)
+            adjusted_note['end'] = min(end_time - start_time, note['end'] - start_time)
+            sliced_notes.append(adjusted_note)
+    
+    return sliced_notes
+
+
+def tokens_to_notes(tokens: List[int], time_quantization: int = 100) -> List[Dict]:
+    """
+    将Token序列逆转换为MIDI音符列表
+    
+    Token编码：
+    - 1: <BOS>
+    - 2: <SEP>
+    - 3: <EOS>
+    - 0, time_delta: TIME事件
+    - 10, pitch: NOTE_ON (旋律)
+    - 11, pitch: NOTE_OFF (旋律)
+    - 20, pitch: NOTE_ON (伴奏)
+    - 21, pitch: NOTE_OFF (伴奏)
+    
+    Args:
+        tokens: Token序列
+        time_quantization: 时间量化单位（毫秒）
+    
+    Returns:
+        音符列表
+    """
+    notes = []
+    active_notes = {}  # {pitch: {'start': time, 'is_melody': bool}}
+    current_time = 0.0
+    note_id = 0
+    
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        
+        # 跳过特殊标记
+        if token in [1, 2, 3]:  # <BOS>, <SEP>, <EOS>
+            i += 1
+            continue
+        
+        # TIME事件
+        if token == 0:
+            if i + 1 < len(tokens):
+                time_delta = tokens[i + 1]
+                current_time += (time_delta * time_quantization) / 1000.0
+                i += 2
+            else:
+                i += 1
+        
+        # NOTE_ON (旋律)
+        elif token == 10:
+            if i + 1 < len(tokens):
+                pitch = tokens[i + 1]
+                active_notes[pitch] = {
+                    'start': current_time,
+                    'is_melody': True
+                }
+                i += 2
+            else:
+                i += 1
+        
+        # NOTE_OFF (旋律)
+        elif token == 11:
+            if i + 1 < len(tokens):
+                pitch = tokens[i + 1]
+                if pitch in active_notes:
+                    note_info = active_notes.pop(pitch)
+                    notes.append({
+                        'id': note_id,
+                        'start': note_info['start'],
+                        'end': current_time,
+                        'pitch': pitch,
+                        'velocity': 80,  # 默认力度
+                        'is_melody': note_info['is_melody']
+                    })
+                    note_id += 1
+                i += 2
+            else:
+                i += 1
+        
+        # NOTE_ON (伴奏)
+        elif token == 20:
+            if i + 1 < len(tokens):
+                pitch = tokens[i + 1]
+                active_notes[pitch] = {
+                    'start': current_time,
+                    'is_melody': False
+                }
+                i += 2
+            else:
+                i += 1
+        
+        # NOTE_OFF (伴奏)
+        elif token == 21:
+            if i + 1 < len(tokens):
+                pitch = tokens[i + 1]
+                if pitch in active_notes:
+                    note_info = active_notes.pop(pitch)
+                    notes.append({
+                        'id': note_id,
+                        'start': note_info['start'],
+                        'end': current_time,
+                        'pitch': pitch,
+                        'velocity': 80,  # 默认力度
+                        'is_melody': note_info['is_melody']
+                    })
+                    note_id += 1
+                i += 2
+            else:
+                i += 1
+        
+        else:
+            # 未知token，跳过
+            i += 1
+    
+    return notes
+
+
+def midi_to_tokens(notes: List[Dict], duration: float, time_quantization: int = 100, 
+                   start_time: float = 0.0, end_time: float = None) -> Dict[str, List[int]]:
+    """
+    将 MIDI 音符转换为训练用的 Token 序列（纯数字格式）
+    
+    生成格式：[1] + Source + [2] + Target + [3]
+    - Source: 只包含旋律音符的token
+    - Target: 包含所有音符的token
+    
+    Token编码：
+    - 1: <BOS>
+    - 2: <SEP>
+    - 3: <EOS>
+    - 0, time_delta: TIME事件
+    - 10, pitch: NOTE_ON (旋律)
+    - 11, pitch: NOTE_OFF (旋律)
+    - 20, pitch: NOTE_ON (伴奏)
+    - 21, pitch: NOTE_OFF (伴奏)
     
     Args:
         notes: 音符列表
         duration: MIDI 总时长
         time_quantization: 时间量化单位（毫秒）
-        vocab_type: Token 类型
+        start_time: 切片开始时间（用于切片）
+        end_time: 切片结束时间（用于切片）
     
     Returns:
-        Token 序列
+        包含 source、target、training_sequence 的字典
     """
-    # 创建事件列表：(时间, 事件类型, 音高, 力度, 是否旋律)
-    events = []
+    # 如果指定了切片时间，则进行切片
+    if end_time is not None:
+        notes = slice_notes_by_time(notes, start_time, end_time)
+    # 创建事件列表
+    all_events = []
+    melody_events = []
     
     for note in notes:
         # NOTE_ON 事件
-        events.append({
+        event_on = {
             'time': note['start'],
             'type': 'note_on',
             'pitch': note['pitch'],
             'velocity': note['velocity'],
             'is_melody': note['is_melody']
-        })
+        }
         # NOTE_OFF 事件
-        events.append({
+        event_off = {
             'time': note['end'],
             'type': 'note_off',
             'pitch': note['pitch'],
             'velocity': 0,
             'is_melody': note['is_melody']
-        })
+        }
+        
+        all_events.append(event_on)
+        all_events.append(event_off)
+        
+        # 只添加旋律到melody_events
+        if note['is_melody']:
+            melody_events.append(event_on)
+            melody_events.append(event_off)
     
     # 按时间排序
-    events.sort(key=lambda x: (x['time'], x['type'] == 'note_off'))
+    all_events.sort(key=lambda x: (x['time'], x['type'] == 'note_off'))
+    melody_events.sort(key=lambda x: (x['time'], x['type'] == 'note_off'))
     
-    # 转换为 Token
-    tokens = []
+    # 生成 Source tokens (仅旋律) - 纯数字格式
+    source_tokens = []
     current_time = 0
+    for event in melody_events:
+        time_delta = int((event['time'] - current_time) * 1000 / time_quantization)
+        if time_delta > 0:
+            source_tokens.extend([0, time_delta])  # TIME事件
+            current_time = event['time']
+        
+        if event['type'] == 'note_on':
+            source_tokens.extend([10, event['pitch']])  # NOTE_ON (旋律)
+        else:
+            source_tokens.extend([11, event['pitch']])  # NOTE_OFF (旋律)
     
-    if vocab_type == "compound":
-        # 复合 Token 方式
-        for event in events:
-            # 计算时间差（量化）
-            time_delta = int((event['time'] - current_time) * 1000 / time_quantization)
-            
-            if time_delta > 0:
-                tokens.append(f"TIME_SHIFT_{time_delta}")
-                current_time = event['time']
-            
-            # 音符事件
-            melody_tag = "_MELODY" if event['is_melody'] else "_ACCOMP"
+    # 生成 Target tokens (所有音符) - 纯数字格式
+    target_tokens = []
+    current_time = 0
+    for event in all_events:
+        time_delta = int((event['time'] - current_time) * 1000 / time_quantization)
+        if time_delta > 0:
+            target_tokens.extend([0, time_delta])  # TIME事件
+            current_time = event['time']
+        
+        if event['is_melody']:
             if event['type'] == 'note_on':
-                tokens.append(f"NOTE_ON_{event['pitch']}_{event['velocity']}{melody_tag}")
+                target_tokens.extend([10, event['pitch']])  # NOTE_ON (旋律)
             else:
-                tokens.append(f"NOTE_OFF_{event['pitch']}{melody_tag}")
-    
-    elif vocab_type == "simple":
-        # 简单 Token 方式（数字序列）
-        for event in events:
-            # 时间差（量化）
-            time_delta = int((event['time'] - current_time) * 1000 / time_quantization)
-            
-            if time_delta > 0:
-                tokens.extend([0, time_delta])  # 0 = TIME_SHIFT
-                current_time = event['time']
-            
-            # 音符事件
-            melody_flag = 1 if event['is_melody'] else 0
+                target_tokens.extend([11, event['pitch']])  # NOTE_OFF (旋律)
+        else:
             if event['type'] == 'note_on':
-                tokens.extend([1, event['pitch'], event['velocity'], melody_flag])  # 1 = NOTE_ON
+                target_tokens.extend([20, event['pitch']])  # NOTE_ON (伴奏)
             else:
-                tokens.extend([2, event['pitch'], melody_flag])  # 2 = NOTE_OFF
+                target_tokens.extend([21, event['pitch']])  # NOTE_OFF (伴奏)
     
-    return tokens
+    # 拼接训练序列: [1] + Source + [2] + Target + [3]
+    training_sequence = [1] + source_tokens + [2] + target_tokens + [3]
+    
+    return {
+        "source": source_tokens,
+        "target": target_tokens,
+        "training_sequence": training_sequence
+    }
 
 
 def skyline_algorithm(notes: List[Dict], time_window: float = 0.05) -> List[Dict]:
@@ -305,22 +493,22 @@ async def export_midi(request: ExportRequest):
 @app.post("/tokenize")
 async def tokenize_midi(request: TokenizeRequest):
     """
-    将 MIDI 数据转换为 Token 序列
+    将 MIDI 数据转换为训练用 Token 序列
     
-    支持两种格式：
-    - compound: 复合token (如 "TIME_SHIFT_10", "NOTE_ON_60_80_MELODY")
-    - simple: 简单数字序列 (如 [0, 10, 1, 60, 80, 1])
+    返回格式：
+    - source: 仅旋律的token序列
+    - target: 完整（旋律+伴奏）的token序列
+    - training_sequence: <BOS> [Source] <SEP> [Target] <EOS>
     """
     try:
         # 转换为字典格式
         notes_dict = [note.dict() for note in request.notes]
         
         # 生成 Token
-        tokens = midi_to_tokens(
+        token_result = midi_to_tokens(
             notes_dict,
             request.duration,
-            request.time_quantization,
-            request.vocab_type
+            request.time_quantization
         )
         
         # 统计信息
@@ -328,18 +516,204 @@ async def tokenize_midi(request: TokenizeRequest):
         accomp_count = len(request.notes) - melody_count
         
         return {
-            "tokens": tokens,
-            "token_count": len(tokens),
+            "source_tokens": token_result["source"],
+            "target_tokens": token_result["target"],
+            "training_sequence": token_result["training_sequence"],
+            "source_length": len(token_result["source"]),
+            "target_length": len(token_result["target"]),
+            "total_length": len(token_result["training_sequence"]),
             "note_count": len(request.notes),
             "melody_count": melody_count,
             "accompaniment_count": accomp_count,
             "duration": request.duration,
-            "vocab_type": request.vocab_type,
             "time_quantization_ms": request.time_quantization
         }
     
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Token化时出错: {str(e)}")
+
+
+@app.post("/tokenize_sliced")
+async def tokenize_midi_sliced(request: TokenizeSlicedRequest):
+    """
+    将 MIDI 数据切片并转换为多个训练样本
+    
+    按固定时间切片（如15秒），生成多个独立的训练序列
+    每个序列格式：[1] + Source + [2] + Target + [3]
+    
+    返回多个样本，适合模型训练
+    """
+    try:
+        # 转换为字典格式
+        notes_dict = [note.dict() for note in request.notes]
+        
+        # 计算切片数量
+        slice_duration = request.slice_duration
+        overlap = request.overlap
+        step = slice_duration - overlap
+        num_slices = int(np.ceil((request.duration - overlap) / step))
+        
+        samples = []
+        
+        for i in range(num_slices):
+            start_time = i * step
+            end_time = min(start_time + slice_duration, request.duration)
+            
+            # 生成该切片的Token
+            token_result = midi_to_tokens(
+                notes_dict,
+                request.duration,
+                request.time_quantization,
+                start_time,
+                end_time
+            )
+            
+            # 只保留有内容的切片
+            if len(token_result["source"]) > 0 or len(token_result["target"]) > 0:
+                samples.append({
+                    "slice_id": i,
+                    "start_time": start_time,
+                    "end_time": end_time,
+                    "duration": end_time - start_time,
+                    "training_sequence": token_result["training_sequence"],
+                    "source_length": len(token_result["source"]),
+                    "target_length": len(token_result["target"]),
+                    "total_length": len(token_result["training_sequence"])
+                })
+        
+        # 统计信息
+        melody_count = sum(1 for n in request.notes if n.is_melody)
+        accomp_count = len(request.notes) - melody_count
+        
+        return {
+            "samples": samples,
+            "num_samples": len(samples),
+            "slice_duration": slice_duration,
+            "overlap": overlap,
+            "total_duration": request.duration,
+            "note_count": len(request.notes),
+            "melody_count": melody_count,
+            "accompaniment_count": accomp_count,
+            "time_quantization_ms": request.time_quantization,
+            "avg_sample_length": int(np.mean([s["total_length"] for s in samples])) if samples else 0,
+            "max_sample_length": max([s["total_length"] for s in samples]) if samples else 0
+        }
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"切片Token化时出错: {str(e)}")
+
+
+@app.post("/json_to_midi")
+async def json_to_midi(request: JsonToMidiRequest):
+    """
+    将精简的 JSON 音符数据转换为 MIDI 文件
+    
+    接受包含音符列表的JSON，生成标准MIDI文件
+    """
+    try:
+        # 创建 MIDI 对象
+        midi = pretty_midi.PrettyMIDI()
+        
+        # 创建乐器轨道
+        instrument = pretty_midi.Instrument(program=0, name="Piano")
+        
+        # 添加所有音符
+        for note_data in request.notes:
+            note = pretty_midi.Note(
+                velocity=note_data.velocity,
+                pitch=note_data.pitch,
+                start=note_data.start,
+                end=note_data.end
+            )
+            instrument.notes.append(note)
+        
+        # 添加乐器到 MIDI
+        midi.instruments.append(instrument)
+        
+        # 写入到内存
+        midi_buffer = io.BytesIO()
+        midi.write(midi_buffer)
+        midi_buffer.seek(0)
+        
+        return StreamingResponse(
+            midi_buffer,
+            media_type="audio/midi",
+            headers={"Content-Disposition": f"attachment; filename={request.filename}"}
+        )
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"JSON转MIDI时出错: {str(e)}")
+
+
+@app.post("/tokens_to_midi")
+async def tokens_to_midi(request: TokensToMidiRequest):
+    """
+    将Token序列逆转换为MIDI文件
+    
+    接受training_sequence或任何token序列，逆转换为MIDI
+    """
+    try:
+        # 将tokens转换为音符列表
+        notes = tokens_to_notes(request.training_sequence, request.time_quantization)
+        
+        if not notes:
+            raise HTTPException(status_code=400, detail="无法从Token序列中解析出有效音符")
+        
+        # 创建 MIDI 对象
+        midi = pretty_midi.PrettyMIDI()
+        
+        # 创建乐器轨道
+        instrument = pretty_midi.Instrument(program=0, name="Piano")
+        
+        # 添加所有音符
+        for note_data in notes:
+            note = pretty_midi.Note(
+                velocity=note_data['velocity'],
+                pitch=note_data['pitch'],
+                start=note_data['start'],
+                end=note_data['end']
+            )
+            instrument.notes.append(note)
+        
+        # 添加乐器到 MIDI
+        midi.instruments.append(instrument)
+        
+        # 写入到内存
+        midi_buffer = io.BytesIO()
+        midi.write(midi_buffer)
+        midi_buffer.seek(0)
+        
+        return StreamingResponse(
+            midi_buffer,
+            media_type="audio/midi",
+            headers={"Content-Disposition": f"attachment; filename={request.filename}"}
+        )
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Token转MIDI时出错: {str(e)}")
+
+
+@app.post("/tokens_to_notes")
+async def tokens_to_notes_endpoint(request: TokensToMidiRequest):
+    """
+    将Token序列转换为音符列表（不生成MIDI文件）
+    
+    用于前端拼接多个切片时使用
+    """
+    try:
+        # 将tokens转换为音符列表
+        notes = tokens_to_notes(request.training_sequence, request.time_quantization)
+        
+        if not notes:
+            raise HTTPException(status_code=400, detail="无法从Token序列中解析出有效音符")
+        
+        return {
+            "notes": notes,
+            "count": len(notes)
+        }
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Token解析时出错: {str(e)}")
 
 
 if __name__ == "__main__":
